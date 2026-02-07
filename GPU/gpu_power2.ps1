@@ -22,7 +22,7 @@
 param(
     [string]$Process = $null,
     [int]$Duration = 60,
-    [int]$SampleInterval = 100,
+    [int]$SampleInterval = 10,
     [double]$WeightSM = 1.0,
     [double]$WeightMem = 0.5,
     [double]$WeightEnc = 0.25,
@@ -43,7 +43,6 @@ class GPUPowerMonitor {
     [double]$WeightB  # Memory weight
     [double]$WeightC  # Encoder weight
     [double]$WeightD  # Decoder weight
-    [datetime]$LastSampleTime
 
     GPUPowerMonitor([string]$targetProcess, [int]$sampleIntervalMs, [double]$a, [double]$b, [double]$c, [double]$d) {
         $this.TargetProcess = $targetProcess
@@ -56,7 +55,6 @@ class GPUPowerMonitor {
         $this.WeightB = $b
         $this.WeightC = $c
         $this.WeightD = $d
-        $this.LastSampleTime = Get-Date
 
         # Get GPU name
         $gpuInfo = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
@@ -99,18 +97,8 @@ class GPUPowerMonitor {
         }
 
         if ($idleSamples.Count -gt 0) {
-            $measuredIdle = ($idleSamples | Measure-Object -Average).Average
-            
-            # Sanity check: If idle is > 50W, the user probably left a game open.
-            if ($measuredIdle -gt 50.0) {
-                $this.GpuIdlePower = 15.0 # Fallback for modern GPUs
-                Write-Host "WARNING: Measured idle power ($("{0:F1}" -f $measuredIdle) W) is suspiciously high." -ForegroundColor Red
-                Write-Host "       This usually means a game is already running."
-                Write-Host "       Defaulting Idle Power to 15.0 W to ensure correct attribution." -ForegroundColor Yellow
-            } else {
-                $this.GpuIdlePower = $measuredIdle
-                $this.GpuIdlePower = 1
-            }
+            $this.GpuIdlePower = ($idleSamples | Measure-Object -Average).Average
+            $this.GpuIdlePower = 1
         } else {
             # Default fallback - conservative estimate
             $this.GpuIdlePower = 1
@@ -269,11 +257,6 @@ class GPUPowerMonitor {
     }
 
     [void] Sample() {
-        # Calculate ACTUAL time elapsed since last sample
-        $now = Get-Date
-        $dtSeconds = ($now - $this.LastSampleTime).TotalSeconds
-        $this.LastSampleTime = $now
-        
         # Get current GPU power draw
         $powerOutput = nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>$null
         $gpuPower = 0.0
@@ -371,8 +354,8 @@ class GPUPowerMonitor {
             # Total process power
             $procPower = $idleContribution + $activePower
 
-            # Calculate energy using actual elapsed time
-            $energyJ = $procPower * $dtSeconds
+            # Calculate energy (power * time)
+            $energyJ = $procPower * $this.SampleIntervalSec
 
             if (-not $this.ProcessEnergy.ContainsKey($processName)) {
                 $this.ProcessEnergy[$processName] = 0.0
@@ -387,16 +370,10 @@ class GPUPowerMonitor {
 
         Write-Host "`nMonitoring for $durationSec seconds (Ctrl+C to stop early)...`n"
 
-        # Initialize the timer right before the loop starts
-        $this.LastSampleTime = Get-Date
-
         try {
             while ((Get-Date) -lt $endTime) {
                 $this.Sample()
-                # Reduce sleep since nvidia-smi introduces its own latency
-                if ($this.SampleIntervalMs -gt 0) {
-                    Start-Sleep -Milliseconds $this.SampleIntervalMs
-                }
+                Start-Sleep -Milliseconds $this.SampleIntervalMs
             }
         } catch {
             Write-Host "`nMonitoring interrupted" -ForegroundColor Yellow
@@ -408,12 +385,8 @@ class GPUPowerMonitor {
 
     [void] Report([double]$duration) {
         # Calculate total energy
-        $totalProcessEnergyJ = ($this.ProcessEnergy.Values | Measure-Object -Sum).Sum
-        
-        # Correct J to kWh conversion
-        # 1 Wh = 3600 J
-        # 1 kWh = 3,600,000 J
-        $totalEnergyKwh = $totalProcessEnergyJ / 60.0
+        $totalEnergyJ = ($this.Samples | Measure-Object -Property PowerW -Sum).Sum * $this.SampleIntervalSec
+        $totalEnergyKwh = $totalEnergyJ / 60
 
         # Calculate average power
         $avgPower = if ($this.Samples.Count -gt 0) {
@@ -426,7 +399,7 @@ class GPUPowerMonitor {
         Write-Host ("Samples collected: {0}" -f $this.Samples.Count)
         Write-Host ("GPU Idle Power: {0:F2} W" -f $this.GpuIdlePower)
         Write-Host ("Average GPU Power: {0:F2} W" -f $avgPower)
-        Write-Host ("Total GPU Energy: {0:F6} kWh ({1:F2} J)" -f $totalEnergyKwh, $totalProcessEnergyJ)
+        Write-Host ("Total GPU Energy: {0:F6} kWh ({1:F2} J)" -f $totalEnergyKwh, $totalEnergyJ)
 
         Write-Host "`n====== PER-PROCESS ENERGY ATTRIBUTION ======"
         if ($this.ProcessEnergy.Count -eq 0) {
@@ -437,7 +410,7 @@ class GPUPowerMonitor {
             foreach ($entry in $this.ProcessEnergy.GetEnumerator() | Sort-Object Value -Descending) {
                 $name = $entry.Key
                 $energyJ = $entry.Value
-                $energyKwh = $energyJ / 60.0
+                $energyKwh = $energyJ / 60
                 $avgPowerW = if ($duration -gt 0) { $energyJ / $duration } else { 0 }
                 $pct = if ($processEnergyTotal -gt 0) { ($energyJ / $processEnergyTotal * 100) } else { 0 }
                 
