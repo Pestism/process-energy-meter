@@ -7,5 +7,6 @@ pip install nvidia-ml-py3
 
 
 for powershell:
-gpu_power is new one, for now the per process and overall are the same. will fix
-gpu_power2 is old with some bugs, it underestimates a lot
+gpu_power: alex. uses sm, mem, enc, dec
+gpu_smGame: Mohammad, uses only sm. works for game
+gpu_enc: Mohammad, uses sm, mem, enc, dec
